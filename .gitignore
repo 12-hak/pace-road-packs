@@ -1,0 +1,17 @@
+# Build caches and Geofabrik extracts (large; never commit)
+tools/cache/
+*.osm.pbf
+*.osm.pbf.part
+
+# Pack artifacts (published via GitHub Releases only)
+dist/
+out/
+road_pack.csv
+road_pack.csv.gz
+pack-manifest.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

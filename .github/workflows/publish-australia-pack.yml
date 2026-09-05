@@ -1,0 +1,173 @@
+name: Publish Australia OSM pack
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Geofabrik Australia extracts refresh often enough for a weekly republish.
+    - cron: "0 6 * * 1" # Monday 06:00 UTC
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-australia-pack
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check free disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          avail_kb="$(df -Pk / | awk 'NR==2 {print $4}')"
+          # Need headroom for ~1GB PBF + osmium indexes + CSV + gzip (~8GB safe floor).
+          need_kb=$((8 * 1024 * 1024))
+          echo "Available KiB: ${avail_kb} (need >= ${need_kb})"
+          if [ "${avail_kb}" -lt "${need_kb}" ]; then
+            echo "::error::Insufficient disk space for Australia PBF build (need ~8 GiB free)."
+            df -h
+            exit 1
+          fi
+          # Drop unused caches to maximise free space on the runner.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Decide whether Geofabrik has a newer extract
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          STATE_URL="https://download.geofabrik.de/australia-oceania/australia-updates/state.txt"
+          MANIFEST_URL="https://github.com/${{ github.repository }}/releases/latest/download/pack-manifest.json"
+
+          geo_raw="$(curl -fsSL -A "Pace-road-pack-ci" "$STATE_URL")"
+          geo_ts="$(printf '%s\n' "$geo_raw" | sed -n 's/^timestamp=//p' | tr -d '\\' | tr -d '\r' | head -n1)"
+          if [ -z "$geo_ts" ]; then
+            echo "::error::Could not parse Geofabrik state.txt timestamp"
+            printf '%s\n' "$geo_raw"
+            exit 1
+          fi
+          echo "Geofabrik osmTimestamp=${geo_ts}"
+
+          rel_ts=""
+          rel_sha=""
+          if curl -fsSL -A "Pace-road-pack-ci" -o /tmp/latest-pack-manifest.json "$MANIFEST_URL"; then
+            rel_ts="$(python -c 'import json; print(json.load(open("/tmp/latest-pack-manifest.json")).get("osmTimestamp",""))')"
+            rel_sha="$(python -c 'import json; print(json.load(open("/tmp/latest-pack-manifest.json")).get("sha256",""))')"
+            echo "Latest release osmTimestamp=${rel_ts}"
+            echo "Latest release sha256=${rel_sha}"
+          else
+            echo "No latest release manifest found; will build."
+          fi
+
+          if [ -n "$rel_ts" ] && [ "$geo_ts" = "$rel_ts" ]; then
+            echo "no_update=true" >> "$GITHUB_OUTPUT"
+            echo "Geofabrik extract matches latest release osmTimestamp (${geo_ts}). No update."
+            exit 0
+          fi
+
+          if [ -n "$rel_ts" ] && [ "$geo_ts" '<' "$rel_ts" ]; then
+            echo "no_update=true" >> "$GITHUB_OUTPUT"
+            echo "Geofabrik timestamp ${geo_ts} is not newer than release ${rel_ts}. No update."
+            exit 0
+          fi
+
+          echo "no_update=false" >> "$GITHUB_OUTPUT"
+          echo "geo_ts=${geo_ts}" >> "$GITHUB_OUTPUT"
+          echo "rel_ts=${rel_ts}" >> "$GITHUB_OUTPUT"
+          echo "rel_sha=${rel_sha}" >> "$GITHUB_OUTPUT"
+          echo "Update needed: release='${rel_ts:-<none>}' -> geofabrik='${geo_ts}'"
+
+      - name: Build road pack
+        if: steps.decide.outputs.no_update != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p dist tools/cache
+          python tools/build_road_pack.py --out-dir dist
+          test -f dist/road_pack.csv.gz
+          test -f dist/pack-manifest.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          m = json.loads(Path("dist/pack-manifest.json").read_text())
+          assert m.get("sha256"), "missing sha256"
+          assert m.get("osmTimestamp"), "missing osmTimestamp"
+          assert Path("dist/road_pack.csv.gz").stat().st_size == m["bytes"]
+          print("manifest ok:", m["osmTimestamp"], m["sha256"][:16] + "…", m["bytes"], "bytes")
+          PY
+          # Free PBF / intermediate CSV before uploading release assets.
+          rm -rf tools/cache
+          df -h /
+
+      - name: Skip release when pack unchanged
+        id: unchanged
+        if: steps.decide.outputs.no_update != 'true'
+        run: |
+          set -euo pipefail
+          new_sha="$(python -c 'import json; print(json.load(open("dist/pack-manifest.json"))["sha256"])')"
+          new_ts="$(python -c 'import json; print(json.load(open("dist/pack-manifest.json"))["osmTimestamp"])')"
+          rel_sha="${{ steps.decide.outputs.rel_sha }}"
+          echo "Built osmTimestamp=${new_ts} sha256=${new_sha}"
+          if [ -n "$rel_sha" ] && [ "$new_sha" = "$rel_sha" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Built pack sha256 matches latest release. No update."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "new_ts=${new_ts}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        if: steps.decide.outputs.no_update != 'true' && steps.unchanged.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          day="$(date -u +%Y-%m-%d)"
+          tag="$day"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            tag="$(date -u +%Y-%m-%d-%H%M)"
+            echo "Tag ${day} already exists; using ${tag}"
+          fi
+          title="Australia OSM pack ${day}"
+          osm_ts="$(python -c 'import json; print(json.load(open("dist/pack-manifest.json"))["osmTimestamp"])')"
+          sha="$(python -c 'import json; print(json.load(open("dist/pack-manifest.json"))["sha256"])')"
+          bytes="$(python -c 'import json; print(json.load(open("dist/pack-manifest.json"))["bytes"])')"
+          notes="$(cat <<MD
+          Australia OSM speed-limit pack for Pace.
+
+          - OSM extract timestamp: \`${osm_ts}\`
+          - Pack SHA-256: \`${sha}\`
+          - Size: ${bytes} bytes
+          - Source: [Geofabrik Australia](https://download.geofabrik.de/australia-oceania/australia.html)
+
+          Road data © OpenStreetMap contributors, [ODbL 1.0](https://opendatacommons.org/licenses/odbl/).
+          MD
+          )"
+          gh release create "$tag" \
+            --title "$title" \
+            --notes "$notes" \
+            --latest \
+            dist/pack-manifest.json \
+            dist/road_pack.csv.gz
+          echo "Published release ${tag} (${title})"

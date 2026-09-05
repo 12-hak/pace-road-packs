@@ -1,0 +1,2 @@
+# pyosmium bindings (import name: osmium)
+osmium>=4.0.0

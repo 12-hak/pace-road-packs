@@ -1,14 +1,8 @@
 """Build Pace's on-device OSM speed pack from a Geofabrik extract.
 
-Downloads are build-time only. The Pace app never queries OSM while driving.
+Downloads are build-time only. The app never queries OSM while driving.
 
-Artifacts are written to dist/ (pack-manifest.json + road_pack.csv.gz) for
-GitHub Release publishing from this data repo.
-
-  python3 tools/build_road_pack.py
-  python3 tools/build_road_pack.py --out-dir dist
-
-Road data © OpenStreetMap contributors (ODbL 1.0).
+  py -3.11 tools/build_road_pack.py
 """
 
 from __future__ import annotations
@@ -20,6 +14,7 @@ import json
 import math
 import re
 import sys
+import time
 import urllib.request
 from datetime import date
 from pathlib import Path
@@ -28,7 +23,7 @@ import osmium
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE = ROOT / "tools" / "cache"
-DEFAULT_OUT = ROOT / "dist"
+ASSETS = ROOT / "app" / "src" / "main" / "assets"
 DEFAULT_URL = "https://download.geofabrik.de/australia-oceania/australia-latest.osm.pbf"
 DEFAULT_REGION = "Australia"
 STATE_URL = "https://download.geofabrik.de/australia-oceania/australia-updates/state.txt"
@@ -137,9 +132,21 @@ def download(url: str, dest: Path) -> None:
         return
     print(f"Downloading {url}")
     tmp = dest.with_suffix(dest.suffix + ".part")
-    urllib.request.urlretrieve(url, tmp)
-    tmp.replace(dest)
-    print(f"Saved {dest} ({dest.stat().st_size:,} bytes)")
+    last_error: Exception | None = None
+    for attempt in range(1, 5):
+        try:
+            urllib.request.urlretrieve(url, tmp)
+            tmp.replace(dest)
+            print(f"Saved {dest} ({dest.stat().st_size:,} bytes)")
+            return
+        except Exception as exc:
+            last_error = exc
+            print(f"Download attempt {attempt} failed: {exc}")
+            if tmp.exists():
+                tmp.unlink()
+            if attempt < 4:
+                time.sleep(2 ** attempt)
+    raise RuntimeError(f"Failed to download {url}") from last_error
 
 
 def build_rows(pbf: Path) -> list[str]:
@@ -203,8 +210,7 @@ def geofabrik_timestamp(state_url: str = STATE_URL) -> str:
         text = response.read().decode("utf-8", errors="replace")
     for line in text.splitlines():
         if line.startswith("timestamp="):
-            # Geofabrik escapes colons as \:
-            return line.split("=", 1)[1].strip().replace(r"\:", ":")
+            return line.split("=", 1)[1].strip()
     return ""
 
 
@@ -219,6 +225,16 @@ def sha256_file(path: Path) -> str:
 def write_manifest(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def write_gzip_deterministic(path: Path, text: str) -> None:
+    """Write gzip with a fixed mtime and stored name so identical data yields
+    an identical sha256. This lets release publishing skip unchanged packs."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = text.encode("utf-8")
+    with open(path, "wb") as raw:
+        with gzip.GzipFile(filename=path.name, mode="wb", fileobj=raw, mtime=0) as gz:
+            gz.write(data)
 
 
 def rows_from_cache() -> tuple[list[str], str]:
@@ -236,10 +252,14 @@ def rows_from_cache() -> tuple[list[str], str]:
     return rows, source
 
 
-def write_pack(rows: list[str], region: str, source: str, out_dir: Path) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    CACHE.mkdir(parents=True, exist_ok=True)
-    osm_ts = extract_timestamp()
+def write_pack(
+    rows: list[str],
+    region: str,
+    source: str,
+    out_dir: Path | None = None,
+    pbf: Path | None = None,
+) -> None:
+    osm_ts = extract_timestamp(pbf)
     built = date.today().isoformat()
     header = [
         f"# region={region}",
@@ -251,11 +271,23 @@ def write_pack(rows: list[str], region: str, source: str, out_dir: Path) -> None
         "# Road data © OpenStreetMap contributors",
     ]
     body = "\n".join(header + rows) + "\n"
-    cache_csv = CACHE / "road_pack.csv"
-    gz_path = out_dir / "road_pack.csv.gz"
-    cache_csv.write_text(body, encoding="utf-8")
-    with gzip.open(gz_path, "wt", encoding="utf-8", newline="\n") as handle:
-        handle.write(body)
+
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        gz_path = out_dir / "road_pack.csv.gz"
+        manifest_path = out_dir / "pack-manifest.json"
+    else:
+        ASSETS.mkdir(parents=True, exist_ok=True)
+        CACHE.mkdir(parents=True, exist_ok=True)
+        cache_csv = CACHE / "road_pack.csv"
+        cache_csv.write_text(body, encoding="utf-8")
+        gz_path = ASSETS / "road_pack.csv.gz"
+        manifest_path = ASSETS / "pack-manifest.json"
+        csv_stub = ASSETS / "road_pack.csv"
+        if csv_stub.exists():
+            csv_stub.unlink()
+
+    write_gzip_deterministic(gz_path, body)
     digest = sha256_file(gz_path)
     payload = {
         "region": region,
@@ -268,23 +300,29 @@ def write_pack(rows: list[str], region: str, source: str, out_dir: Path) -> None
         "licence": "ODbL-1.0",
         "attribution": "Road data © OpenStreetMap contributors",
     }
-    write_manifest(CACHE / "pack-manifest.json", payload)
-    write_manifest(out_dir / "pack-manifest.json", payload)
-    print(f"Wrote {cache_csv} ({cache_csv.stat().st_size:,} bytes)")
+    write_manifest(manifest_path, payload)
+    if out_dir is None:
+        write_manifest(CACHE / "pack-manifest.json", payload)
     print(f"Wrote {gz_path} ({gz_path.stat().st_size:,} bytes)")
-    print(f"Wrote {out_dir / 'pack-manifest.json'}")
+    print(f"Wrote {manifest_path}")
     print(f"osm_date={osm_ts} sha256={digest}")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build Australia OSM road pack for Pace releases")
-    parser.add_argument("--url", default=DEFAULT_URL, help="Geofabrik Australia PBF URL")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--url", default=DEFAULT_URL)
     parser.add_argument("--region", default=DEFAULT_REGION)
-    parser.add_argument("--pbf", default="", help="Local PBF path (default: tools/cache/australia-latest.osm.pbf)")
-    parser.add_argument("--out-dir", default=str(DEFAULT_OUT), help="Output directory for pack artifacts")
-    parser.add_argument("--from-cache", action="store_true", help="Rebuild gz/manifest from cached CSV only")
+    parser.add_argument("--pbf", default="")
+    parser.add_argument("--from-cache", action="store_true")
+    parser.add_argument(
+        "--out-dir",
+        default="",
+        help="Write pack-manifest.json + road_pack.csv.gz here (for release publishing) "
+        "instead of the bundled app assets.",
+    )
     args = parser.parse_args()
-    out_dir = Path(args.out_dir)
+    out_dir = Path(args.out_dir) if args.out_dir else None
+    pbf: Path | None = None
     if args.from_cache:
         rows, source = rows_from_cache()
     else:
@@ -295,7 +333,7 @@ def main() -> int:
     if not rows:
         print("No explicit maxspeed segments found", file=sys.stderr)
         return 1
-    write_pack(rows, args.region, source, out_dir)
+    write_pack(rows, args.region, source, out_dir=out_dir, pbf=pbf)
     return 0
 
 

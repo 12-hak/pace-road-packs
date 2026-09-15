@@ -15,3 +15,11 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# School-zone build sidecars (local only)
+dist/
+*_school_meta.json
+nsw_school_zones.csv.gz
+vic_school_zones.csv.gz
+qld_school_zones.csv.gz
+school-zones-manifest.json

@@ -62,3 +62,69 @@ Each run:
 3. Wait for the job (download + build can take a long time).
 
 Uses the default `GITHUB_TOKEN` with `contents: write` to publish assets on this same repository.
+
+## School-zone overlays (QLD / NSW / VIC)
+
+Separate OSM-derived school-zone packs live on the rolling [`packs`](https://github.com/12-hak/pace-road-packs/releases/tag/packs) release:
+
+- Manifest: `https://github.com/12-hak/pace-road-packs/releases/download/packs/school-zones-manifest.json`
+- Files: `qld_school_zones.csv.gz`, `nsw_school_zones.csv.gz`, `vic_school_zones.csv.gz`
+
+The Pace app keeps the Queensland pack bundled for offline first-run, and downloads NSW/VIC on demand when GPS enters that state (prefer unmetered, same as the road pack).
+
+### Builder
+
+```bash
+python3 tools/build_school_zones.py --state nsw --out-dir dist
+python3 tools/build_school_zones.py --state vic --out-dir dist
+python3 tools/build_school_zones.py --all --out-dir dist   # QLD+NSW+VIC
+```
+
+PBF sources (openstreetmap.fr extracts; underscores in filenames):
+
+| State | URL |
+| --- | --- |
+| QLD | `…/oceania/australia/queensland.osm.pbf` |
+| NSW | `…/oceania/australia/new_south_wales.osm.pbf` |
+| VIC | `…/oceania/australia/victoria.osm.pbf` |
+
+### Manifest schema (v2)
+
+Top-level `region` / `sha256` / `bytes` / `packFile` still describe **Queensland** so older Pace builds keep working. Newer clients read the `states` array:
+
+```json
+{
+  "schemaVersion": 2,
+  "states": [
+    { "code": "QLD", "region": "Queensland", "packFile": "qld_school_zones.csv.gz", "sha256": "…", "bytes": 0, "segments": 0 },
+    { "code": "NSW", "…": "…" },
+    { "code": "VIC", "…": "…" }
+  ]
+}
+```
+
+### Coverage honesty (OSM tagging)
+
+School zones are extracted only where OSM tags indicate a school zone (`hazard=school_zone`, `maxspeed:conditional` with school hours, `source:maxspeed` / `traffic_sign` mentioning school, etc.). **This is not a complete ground-truth inventory of every signed school zone.**
+
+Approximate segment counts from the current build (varies with OSM freshness):
+
+| State | Ways (approx) | Segments (approx) | Notes |
+| --- | --- | --- | --- |
+| QLD | — | ~4.1k | Bundled in Pace APK; also on `packs` |
+| NSW | ~5.9k | ~10.6k | Relatively well tagged |
+| VIC | ~0.9k | ~1.7k | **Thin** — many VIC school zones lack OSM school tagging |
+
+Default active windows when OSM has no usable times: QLD `0700-0900|1400-1600`; NSW/VIC `0800-0930|1430-1600` (local school days). Prefer OSM `maxspeed:conditional` when present.
+
+### Publish to `packs`
+
+```bash
+gh release upload packs \
+  dist/nsw_school_zones.csv.gz \
+  dist/vic_school_zones.csv.gz \
+  dist/school-zones-manifest.json \
+  --clobber --repo 12-hak/pace-road-packs
+```
+
+Do not commit large PBF/CSV artifacts; Releases only.

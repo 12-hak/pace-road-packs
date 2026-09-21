@@ -109,7 +109,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist tools/cache
-          python tools/build_qld_school_zones.py --out dist/qld_school_zones.csv.gz
+          python tools/build_qld_school_zones.py --out-dir dist
           test -f dist/qld_school_zones.csv.gz
           test -f dist/school-zones-manifest.json
           python - <<'PY'

@@ -283,7 +283,7 @@ def build_state(key: str, out_dir: Path, pbf_override: Path | None = None) -> di
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--state", choices=sorted(STATES), help="Build one state")
     parser.add_argument("--all", action="store_true", help="Build QLD+NSW+VIC")
     parser.add_argument("--pbf", default="", help="Override PBF path (single --state)")

@@ -2,6 +2,11 @@ name: Publish OSM packs
 
 on:
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and check everything, but do not publish to the release"
+        type: boolean
+        default: false
   schedule:
     # OSM extracts refresh often enough for a weekly republish.
     - cron: "0 6 * * 1" # Monday 06:00 UTC
@@ -15,6 +20,9 @@ concurrency:
 
 env:
   PACKS_TAG: packs
+  # The published school-zones manifest must always list these states.
+  REQUIRED_SCHOOL_STATES: QLD,NSW,VIC
+  DRY_RUN: ${{ inputs.dry_run == true && 'true' || 'false' }}
 
 jobs:
   publish:
@@ -47,22 +55,36 @@ jobs:
 
       - name: Read current published packs
         id: current
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           base="https://github.com/${{ github.repository }}/releases/download/${PACKS_TAG}"
-          road_sha=""; road_ts=""; school_sha=""
+          road_sha=""; road_ts=""; school_fp=""
           if curl -fsSL -A "Pace-packs-ci" -o /tmp/cur-pack.json "${base}/pack-manifest.json"; then
             road_sha="$(python -c 'import json;print(json.load(open("/tmp/cur-pack.json")).get("sha256",""))')"
             road_ts="$(python -c 'import json;print(json.load(open("/tmp/cur-pack.json")).get("osmTimestamp",""))')"
           fi
           if curl -fsSL -A "Pace-packs-ci" -o /tmp/cur-school.json "${base}/school-zones-manifest.json"; then
-            school_sha="$(python -c 'import json;print(json.load(open("/tmp/cur-school.json")).get("sha256",""))')"
+            school_fp="$(python tools/school_manifest.py fingerprint /tmp/cur-school.json)"
+          else
+            rm -f /tmp/cur-school.json
           fi
+          # Previously published school packs: states not rebuilt this run are carried
+          # forward into the merged manifest (verified by sha256), never dropped.
+          mkdir -p prev-school
+          echo '{"assets":[]}' > /tmp/release-assets.json
+          if gh release view "$PACKS_TAG" --json assets > /tmp/release-assets.json 2>/dev/null; then
+            for f in $(python -c 'import json;print(" ".join(a["name"] for a in json.load(open("/tmp/release-assets.json"))["assets"] if a["name"].endswith("_school_zones.csv.gz")))'); do
+              gh release download "$PACKS_TAG" --pattern "$f" --dir prev-school --clobber
+            done
+          fi
+          ls -l prev-school
           echo "road_sha=${road_sha}" >> "$GITHUB_OUTPUT"
           echo "road_ts=${road_ts}" >> "$GITHUB_OUTPUT"
-          echo "school_sha=${school_sha}" >> "$GITHUB_OUTPUT"
+          echo "school_fp=${school_fp}" >> "$GITHUB_OUTPUT"
           echo "Current road osmTimestamp='${road_ts:-<none>}' sha='${road_sha:0:16}'"
-          echo "Current school sha='${school_sha:0:16}'"
+          echo "Current school states='${school_fp:-<none>}'"
 
       - name: Decide whether the road pack needs rebuilding
         id: roaddecide
@@ -109,31 +131,59 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist tools/cache
-          python tools/build_qld_school_zones.py --out-dir dist
+          base_args=()
+          if [ -f /tmp/cur-school.json ]; then base_args+=(--base-manifest /tmp/cur-school.json); fi
+          # Rebuild QLD only; MERGE NSW/VIC (and any other state) from what is published.
+          python tools/build_qld_school_zones.py --out-dir dist \
+            "${base_args[@]}" --carry-forward-dir prev-school
           test -f dist/qld_school_zones.csv.gz
           test -f dist/school-zones-manifest.json
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          m = json.loads(Path("dist/school-zones-manifest.json").read_text())
-          assert m.get("sha256"), "missing sha256"
-          assert Path("dist/qld_school_zones.csv.gz").stat().st_size == m["bytes"]
-          print("school manifest ok:", m["osmTimestamp"], m["sha256"][:16] + "…", m["bytes"], "bytes")
-          PY
-          new_sha="$(python -c 'import json;print(json.load(open("dist/school-zones-manifest.json"))["sha256"])')"
-          echo "new_sha=${new_sha}" >> "$GITHUB_OUTPUT"
+          # Every listed pack must exist (in dist or on the release) with matching size/sha,
+          # and QLD/NSW/VIC must all be listed. Fails the job instead of publishing a
+          # manifest that would orphan a state again.
+          python tools/school_manifest.py check dist/school-zones-manifest.json \
+            --require "$REQUIRED_SCHOOL_STATES" --dist dist --release-assets /tmp/release-assets.json
+          echo "School manifest change vs published:"
+          if [ -f /tmp/cur-school.json ]; then
+            python tools/school_manifest.py diff /tmp/cur-school.json dist/school-zones-manifest.json
+          else
+            echo "(no published manifest)"
+          fi
+          new_fp="$(python tools/school_manifest.py fingerprint dist/school-zones-manifest.json)"
+          qld_new="$(python -c 'import json;print(json.load(open("dist/school-zones-manifest.json"))["sha256"])')"
+          qld_old=""
+          if [ -f /tmp/cur-school.json ]; then
+            qld_old="$(python -c 'import json;m=json.load(open("/tmp/cur-school.json"));print(next((s.get("sha256","") for s in m.get("states",[]) if s.get("code")=="QLD"), m.get("sha256","")))')"
+          fi
+          echo "new_fp=${new_fp}" >> "$GITHUB_OUTPUT"
+          echo "qld_changed=$([ "$qld_new" != "$qld_old" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           rm -rf tools/cache
           df -h /
 
+      - name: Upload manifests for review (dry run)
+        if: env.DRY_RUN == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dry-run-manifests
+          path: |
+            dist/*.json
+            /tmp/cur-school.json
+          if-no-files-found: warn
+
       - name: Publish rolling release
+        if: env.DRY_RUN != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [ "${DRY_RUN}" = "true" ]; then echo "Dry run: not publishing."; exit 0; fi
           road_new="${{ steps.road.outputs.new_sha }}"
           road_old="${{ steps.current.outputs.road_sha }}"
-          school_new="${{ steps.school.outputs.new_sha }}"
-          school_old="${{ steps.current.outputs.school_sha }}"
+          # Compare every listed state (code/sha/bytes/packFile), not just the legacy
+          # top-level QLD sha, so a NSW/VIC repair publishes even when QLD is unchanged.
+          school_new="${{ steps.school.outputs.new_fp }}"
+          school_old="${{ steps.current.outputs.school_fp }}"
+          qld_changed="${{ steps.school.outputs.qld_changed }}"
 
           road_changed=false
           if [ -n "$road_new" ] && [ "$road_new" != "$road_old" ]; then road_changed=true; fi
@@ -147,7 +197,7 @@ jobs:
           fi
 
           notes="$(cat <<'MD'
-          Rolling OSM packs for Pace (road speed limits + Queensland school zones).
+          Rolling OSM packs for Pace (road speed limits + QLD/NSW/VIC school zones).
 
           Pace polls this release's `pack-manifest.json` and `school-zones-manifest.json`
           on start and downloads newer `*.csv.gz` assets over unmetered networks.
@@ -165,12 +215,16 @@ jobs:
             gh release edit "$PACKS_TAG" --notes "$notes" --latest
           fi
 
-          assets=()
+          # Packs first, manifests last, so a client never sees a manifest whose
+          # pack is not there yet.
+          packs=(); manifests=()
           if [ "$road_changed" = "true" ]; then
-            assets+=("dist/pack-manifest.json" "dist/road_pack.csv.gz")
+            packs+=("dist/road_pack.csv.gz"); manifests+=("dist/pack-manifest.json")
           fi
           if [ "$school_changed" = "true" ]; then
-            assets+=("dist/school-zones-manifest.json" "dist/qld_school_zones.csv.gz")
+            if [ "$qld_changed" = "true" ]; then packs+=("dist/qld_school_zones.csv.gz"); fi
+            manifests+=("dist/school-zones-manifest.json")
           fi
-          gh release upload "$PACKS_TAG" "${assets[@]}" --clobber
+          if [ "${#packs[@]}" -gt 0 ]; then gh release upload "$PACKS_TAG" "${packs[@]}" --clobber; fi
+          gh release upload "$PACKS_TAG" "${manifests[@]}" --clobber
           echo "Published ${PACKS_TAG}: road_changed=${road_changed} school_changed=${school_changed}"

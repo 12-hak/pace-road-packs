@@ -29,7 +29,13 @@ from build_road_pack import (
     sha256_file,
     simplify_way,
     write_gzip_deterministic,
-    write_manifest,
+)
+from school_manifest import (  # noqa: E402  (stdlib-only, unit-tested)
+    STATES,
+    assemble_entries,
+    entry_from_pack,
+    load_manifest,
+    write_combined_manifest,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,41 +44,6 @@ DIST = ROOT / "dist"
 
 TIME_RANGE = re.compile(r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})")
 CONDITIONAL_LIMIT = re.compile(r"^\s*(\d{1,3})\s*(?:km/?h)?\s*@", re.IGNORECASE)
-
-# Standard windows when OSM has no usable conditional times.
-# QLD: 7–9 / 14–16. NSW/VIC commonly 8–9:30 / 14:30–16 (document in README).
-STATES = {
-    "qld": {
-        "code": "QLD",
-        "region": "Queensland",
-        "timezone": "Australia/Brisbane",
-        "file": "qld_school_zones.csv.gz",
-        "pbf": "queensland.osm.pbf",
-        "url": "https://download.openstreetmap.fr/extracts/oceania/australia/queensland.osm.pbf",
-        "windows": "0700-0900|1400-1600",
-        "default_limit": 40,
-    },
-    "nsw": {
-        "code": "NSW",
-        "region": "New South Wales",
-        "timezone": "Australia/Sydney",
-        "file": "nsw_school_zones.csv.gz",
-        "pbf": "new_south_wales.osm.pbf",
-        "url": "https://download.openstreetmap.fr/extracts/oceania/australia/new_south_wales.osm.pbf",
-        "windows": "0800-0930|1430-1600",
-        "default_limit": 40,
-    },
-    "vic": {
-        "code": "VIC",
-        "region": "Victoria",
-        "timezone": "Australia/Melbourne",
-        "file": "vic_school_zones.csv.gz",
-        "pbf": "victoria.osm.pbf",
-        "url": "https://download.openstreetmap.fr/extracts/oceania/australia/victoria.osm.pbf",
-        "windows": "0800-0930|1430-1600",
-        "default_limit": 40,
-    },
-}
 
 
 def looks_like_school_zone(tags: osmium.osm.TagList) -> bool:
@@ -238,39 +209,6 @@ def write_overlay(
     return entry
 
 
-def write_combined_manifest(entries: list[dict], out_path: Path) -> None:
-    """Multi-state school-zones-manifest.json.
-
-    Backward compatible: top-level region/sha256/bytes/packFile still describe
-    Queensland so older Pace builds keep working. New clients read `states`.
-    """
-    by_code = {e["code"]: e for e in entries}
-    qld = by_code.get("QLD")
-    if qld is None and entries:
-        qld = entries[0]
-    payload: dict = {
-        "schemaVersion": 2,
-        "built": date.today().isoformat(),
-        "licence": "ODbL-1.0",
-        "attribution": "Road data © OpenStreetMap contributors",
-        "states": entries,
-    }
-    if qld is not None:
-        # Legacy single-pack fields (QLD bundled / previously sole overlay).
-        payload.update(
-            {
-                "region": qld["region"],
-                "osmTimestamp": qld["osmTimestamp"],
-                "sha256": qld["sha256"],
-                "bytes": qld["bytes"],
-                "packFile": qld["packFile"],
-                "source": qld["source"],
-            }
-        )
-    write_manifest(out_path, payload)
-    print(f"Wrote {out_path} ({len(entries)} state(s))")
-
-
 def build_state(key: str, out_dir: Path, pbf_override: Path | None = None) -> dict:
     meta = STATES[key]
     pbf = pbf_override or (CACHE / meta["pbf"])
@@ -291,79 +229,70 @@ def main() -> int:
     parser.add_argument(
         "--manifest-only",
         action="store_true",
-        help="Rebuild school-zones-manifest.json from existing gz files in --out-dir",
+        help="Rebuild school-zones-manifest.json without building any state",
+    )
+    parser.add_argument(
+        "--base-manifest",
+        default="",
+        help=(
+            "Previously published school-zones-manifest.json. States not rebuilt this run "
+            "are carried forward from it instead of being dropped."
+        ),
+    )
+    parser.add_argument(
+        "--carry-forward-dir",
+        default="",
+        help=(
+            "Directory holding the previously published *_school_zones.csv.gz packs. "
+            "Used to verify (by sha256) or rebuild entries for states not rebuilt this run."
+        ),
     )
     args = parser.parse_args()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    if args.manifest_only:
-        entries = []
-        for key, meta in STATES.items():
-            gz = out_dir / meta["file"]
-            if not gz.exists():
-                continue
-            # Minimal entry from file + sidecar if present
-            sidecar = out_dir / f"{key}_school_meta.json"
-            if sidecar.exists():
-                entries.append(json.loads(sidecar.read_text(encoding="utf-8")))
-            else:
-                entries.append(
-                    {
-                        "code": meta["code"],
-                        "region": meta["region"],
-                        "timezone": meta["timezone"],
-                        "osmTimestamp": "",
-                        "built": date.today().isoformat(),
-                        "sha256": sha256_file(gz),
-                        "bytes": gz.stat().st_size,
-                        "packFile": gz.name,
-                        "source": meta["url"],
-                        "licence": "ODbL-1.0",
-                        "attribution": "Road data © OpenStreetMap contributors",
-                        "ways": 0,
-                        "segments": 0,
-                        "defaultWindows": meta["windows"],
-                        "coverageNote": (
-                            "OSM school-zone tagging is incomplete; segment count reflects "
-                            "tagged ways only, not every signed school zone on the ground."
-                        ),
-                    }
-                )
-        write_combined_manifest(entries, out_dir / "school-zones-manifest.json")
-        return 0
+    base_manifest = load_manifest(Path(args.base_manifest)) if args.base_manifest else None
+    carry_dir = Path(args.carry_forward_dir) if args.carry_forward_dir else None
 
     keys: list[str]
-    if args.all:
+    if args.manifest_only:
+        keys = []
+    elif args.all:
         keys = ["qld", "nsw", "vic"]
     elif args.state:
         keys = [args.state]
     else:
-        parser.error("Specify --state or --all")
+        parser.error("Specify --state, --all or --manifest-only")
         return 2
 
-    entries: list[dict] = []
+    rebuilt: list[dict] = []
     for key in keys:
         pbf = Path(args.pbf) if args.pbf and len(keys) == 1 else None
         entry = build_state(key, out_dir, pbf)
         (out_dir / f"{key}_school_meta.json").write_text(
             json.dumps(entry, indent=2) + "\n", encoding="utf-8"
         )
-        entries.append(entry)
+        rebuilt.append(entry)
 
-    # If only building one state, merge with any existing metas in out_dir.
-    if len(keys) == 1:
-        merged: dict[str, dict] = {}
-        for key in STATES:
-            meta_path = out_dir / f"{key}_school_meta.json"
-            if meta_path.exists():
-                merged[key] = json.loads(meta_path.read_text(encoding="utf-8"))
-        for e in entries:
-            for key, meta in STATES.items():
-                if meta["code"] == e["code"]:
-                    merged[key] = e
-        entries = [merged[k] for k in ("qld", "nsw", "vic") if k in merged]
+    if args.manifest_only:
+        # Packs already in out_dir are what would be uploaded: treat them as rebuilt.
+        for key, meta in STATES.items():
+            gz = out_dir / meta["file"]
+            if not gz.exists():
+                continue
+            sidecar = out_dir / f"{key}_school_meta.json"
+            entry = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.exists() else None
+            if entry is None or entry.get("sha256") != sha256_file(gz):
+                entry = entry_from_pack(gz, key)
+            rebuilt.append(entry)
 
+    # Merge, never overwrite: keep every state that was not rebuilt this run.
+    print("Merging school-zones manifest:")
+    entries = assemble_entries(
+        rebuilt,
+        base_manifest=base_manifest,
+        carry_forward_dir=carry_dir,
+        sidecar_dir=out_dir,
+    )
     write_combined_manifest(entries, out_dir / "school-zones-manifest.json")
     return 0
 

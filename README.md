@@ -117,14 +117,41 @@ Approximate segment counts from the current build (varies with OSM freshness):
 
 Default active windows when OSM has no usable times: QLD `0700-0900|1400-1600`; NSW/VIC `0800-0930|1430-1600` (local school days). Prefer OSM `maxspeed:conditional` when present.
 
-### Publish to `packs`
+### Manifest is merged, never overwritten
+
+The weekly job rebuilds **QLD only**. It then merges the new QLD entry into the
+published manifest instead of replacing it, so NSW/VIC stay listed:
+
+1. CI downloads the current `school-zones-manifest.json` and every
+   `*_school_zones.csv.gz` on the `packs` release.
+2. `build_qld_school_zones.py --base-manifest … --carry-forward-dir …` keeps each
+   state that was not rebuilt. If its published pack's sha256 matches the old entry,
+   the entry is kept verbatim; otherwise the entry is rebuilt from the pack header.
+3. `tools/school_manifest.py check` fails the job if QLD, NSW or VIC is missing, if
+   QLD is not the first `states[]` entry (older app parsers read the first match), or if
+   a listed pack is missing or its size/sha differs.
+4. The manifest is republished when any state's sha/bytes/packFile changes (not just
+   QLD's). Packs upload before manifests.
+
+`workflow_dispatch` has a **dry_run** input: it builds and checks everything, uploads
+the manifests as a workflow artifact, and skips publishing.
+
+Tests: `python -m unittest discover -s tests -v` (stdlib only; also run on PRs).
+
+### Publish to `packs` (manual)
+
+Always merge with what is published so other states are not dropped:
 
 ```bash
-gh release upload packs \
-  dist/nsw_school_zones.csv.gz \
-  dist/vic_school_zones.csv.gz \
-  dist/school-zones-manifest.json \
-  --clobber --repo 12-hak/pace-road-packs
+mkdir -p prev && gh release download packs -R 12-hak/pace-road-packs \
+  -p 'school-zones-manifest.json' -p '*_school_zones.csv.gz' -D prev --clobber
+python3 tools/build_school_zones.py --state nsw --out-dir dist \
+  --base-manifest prev/school-zones-manifest.json --carry-forward-dir prev
+gh release view packs -R 12-hak/pace-road-packs --json assets > prev/assets.json
+python3 tools/school_manifest.py check dist/school-zones-manifest.json \
+  --dist dist --release-assets prev/assets.json
+gh release upload packs dist/nsw_school_zones.csv.gz --clobber --repo 12-hak/pace-road-packs
+gh release upload packs dist/school-zones-manifest.json --clobber --repo 12-hak/pace-road-packs
 ```
 
 Do not commit large PBF/CSV artifacts; Releases only.
